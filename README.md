@@ -222,7 +222,15 @@ These numbers come from the sediment project's run record (`validation_state/rec
 
 ### 6.2 Equivalence of this repo with that run
 - **Mesh.** `scripts/make_mesh.sh` produces a `channel.re2` that is byte-identical to the 9045014 mesh, except the 128 bottom-boundary face codes (`mv` → `W`).
-- **200-step run on 12 ranks.** Used to check that the trimmed UDF reproduces the original diagnostics. Result: *pending*.
+- **200-step run on 12 ranks.** Used to check that the trimmed UDF reproduces the original diagnostics (Aurora job 9064489, build and run exit codes 0).
+  - **Result: reproduced.** All wall-model lines at steps 0–3, 100 and 200 match 9045014. This covers setup, grid, sync, `Ubulk_res`, `maxU`, and every u_τ statistic and velocity mean.
+  - **Only two differences:**
+    - `Fx` differs in its last printed digit, at most 2e-10 (about 6e-11 relative).
+    - `Fz` is printed as `-0` in some places and `0` in others.
+  - Both differences are consistent with round-off in the parallel sum. Example at step 200, wall 1:
+    - `Ubulk_res = 23.82730375`
+    - `uTau_mean = 0.66648223`
+    - `Fx = -3.5533269963` (original run: `-3.5533269961`)
 
 ---
 
