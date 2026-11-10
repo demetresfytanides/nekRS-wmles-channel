@@ -1,0 +1,28 @@
+// channel.oudf -- device boundary conditions.
+//
+// Both walls use zeroDirichletN/udfNeumann: the wall-normal velocity is set
+// to zero by the solver (no penetration), and the two tangential tractions
+// come from udfNeumann below.
+//
+// The host (channel.udf, wallModelStep) writes a global-frame traction
+// vector per boundary node into o_usrwrk as three blocks of fieldOffset:
+//   usrwrk[idxVol + c*fieldOffset], c = 0, 1, 2 (x, y, z components).
+// Here it is projected onto the kernel's own tangent basis (t1, t2).
+
+void udfDirichlet(bcData *bc)
+{
+  // Required stub: the velocity Neumann kernel also calls udfDirichlet for
+  // the pressure field on this boundary type. Nothing to set here
+  // (homogeneous Neumann pressure).
+}
+
+void udfNeumann(bcData *bc)
+{
+  if (isField("fluid velocity")) {
+    const dfloat trx = bc->usrwrk[bc->idxVol + 0 * bc->fieldOffset];
+    const dfloat try_ = bc->usrwrk[bc->idxVol + 1 * bc->fieldOffset];
+    const dfloat trz = bc->usrwrk[bc->idxVol + 2 * bc->fieldOffset];
+    bc->tr1 = trx * bc->t1x + try_ * bc->t1y + trz * bc->t1z;
+    bc->tr2 = trx * bc->t2x + try_ * bc->t2y + trz * bc->t2z;
+  }
+}

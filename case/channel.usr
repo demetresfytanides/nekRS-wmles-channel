@@ -1,0 +1,105 @@
+c-----------------------------------------------------------------------
+c  channel.usr -- only usrdat2() does anything: it assigns the numeric
+c  boundary ids that [FLUID VELOCITY] boundaryTypeMap in channel.par refers
+c  to. genbox writes the character codes ('W  ') into the .re2 but leaves
+c  the numeric ids at 0. Both walls carry 'W  ' in channel.box; they are
+c  told apart by face number (genbox/preprocessor face 1 = y-min side,
+c  face 3 = y-max side):
+c     top wall    (y = 2 - z1) -> id 1
+c     bottom wall (y = z1)     -> id 2
+c  The setup print "logbnd-setup: ... wall1(id 1) ... meanY=..." in the
+c  log confirms the mapping (id 1 meanY ~ 1.98, id 2 meanY ~ 0.019).
+c  All other routines are the stock no-op skeleton.
+c-----------------------------------------------------------------------
+      subroutine uservp(ix,iy,iz,eg) ! set variable properties
+      integer ix,iy,iz,eg
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+      udiff  = 0.0
+      utrans = 0.0
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine userf(ix,iy,iz,eg) ! set acceleration term
+      integer ix,iy,iz,eg
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+      ffx = 0.0
+      ffy = 0.0
+      ffz = 0.0
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine userq(ix,iy,iz,eg) ! set source term
+      integer ix,iy,iz,eg
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+      qvol   = 0.0
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine userbc(ix,iy,iz,iside,eg) ! set up boundary conditions
+      integer ix,iy,iz,iside,eg
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+      ux   = 0.0
+      uy   = 0.0
+      uz   = 0.0
+      temp = 0.0
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine useric(ix,iy,iz,eg) ! set up initial conditions
+      integer ix,iy,iz,eg
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+      ux   = 0.0
+      uy   = 0.0
+      uz   = 0.0
+      temp = 0.0
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine userchk()
+      include 'SIZE'
+      include 'TOTAL'
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine userqtl ! Set thermal divergence
+      call userqtl_scig
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine usrdat()   ! This routine to modify element vertices
+      include 'SIZE'
+      include 'TOTAL'
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine usrdat2()  ! assign numeric boundary ids
+      include 'SIZE'
+      include 'TOTAL'
+      integer iel, ifc
+      do iel=1,nelt
+      do ifc=1,2*ndim
+         if(cbc(ifc,iel,1).eq.'W  ') then
+            if(ifc.eq.3) boundaryID(ifc,iel) = 1
+            if(ifc.eq.1) boundaryID(ifc,iel) = 2
+         endif
+      enddo
+      enddo
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine usrdat3()
+      include 'SIZE'
+      include 'TOTAL'
+      return
+      end
+c-----------------------------------------------------------------------

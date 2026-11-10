@@ -1,0 +1,423 @@
+// channel.udf -- wall-modelled LES of a periodic plane channel at Re_tau 5200
+// with the mesh boundary placed in the log layer (README.md explains the setup).
+//
+// What this file does:
+//   1. Forcing: constant mean pressure gradient -dp/dx = rho*u_tau^2/h with
+//      u_tau = 1, added to the x-momentum equation every step (userf).
+//   2. Initial condition (fresh start only): log-law mean profile measured
+//      from the virtual walls plus one divergence-free roll/streak pair.
+//   3. Wall model (every step): at each boundary node, the node's own
+//      tangential velocity is fed into the log law at height zInput (the
+//      distance from the virtual wall to the mesh boundary) to get a local
+//      u_tau; the traction -u_tau^2 * u_t/|u_t| is handed to the device BC
+//      (channel.oudf udfNeumann) through o_usrwrk. Wall-normal velocity is
+//      zero at the boundary (zeroDirichletN).
+//   4. Diagnostics every [CASEDATA] diag_every steps: bulk velocity, max |u|,
+//      per-wall u_tau statistics and the integrated delivered traction.
+//
+// The traction for step n+1 is computed from the velocity at the end of
+// step n (explicit one-step lag); UDF_ExecuteStep(tstep=0) supplies the
+// first traction from the initial condition.
+
+#include "udf.hpp"
+#include "mesh3D.h"
+
+#include <algorithm>
+#include <cmath>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include "logLawWallModel.hpp"
+
+#ifdef __okl__
+#include "channel.oudf"
+#endif
+
+// ---- [CASEDATA] parameters (channel.par)
+static dfloat g_kappa = 0, g_B = 0; // log law U+ = ln(y+)/kappa + B
+static dfloat g_y0Plus = 0;         // initial condition only: U+ = y+ below this y+
+static dfloat g_zInput = 0;         // virtual wall -> mesh boundary distance
+static dfloat g_vwallLo = 0, g_vwallHi = 0; // virtual-wall y positions
+static dfloat g_icAmp = -1;         // IC perturbation amplitude, fraction of U_centerline
+static int g_diagEvery = 100;
+
+// Boundary ids assigned in channel.usr: 1 = top wall, 2 = bottom wall.
+static const int kWallId1 = 1;
+static const int kWallId2 = 2;
+
+static wm::LogLaw g_law;
+static dfloat g_yLo = 0, g_yHi = 0;         // virtual walls (channel extent)
+static dfloat g_meshYLo = 0, g_meshYHi = 0; // mesh extent
+static dfloat g_xLo = 0, g_xHi = 0, g_zLo = 0, g_zHi = 0;
+static dfloat g_dpdx = 0;
+
+// boundary nodes owned by this rank: wall-1 nodes first, then wall-2 nodes
+static std::vector<wm::BoundaryNode> g_nodes;
+static std::vector<dfloat> g_nodeWsJ, g_nodeX, g_nodeY, g_nodeZ;
+static size_t g_nWall1 = 0;
+static dfloat g_wallY1 = 0, g_wallY2 = 0; // mean y of each wall's boundary nodes
+
+// Constant mean pressure gradient in x.
+void userf(double time)
+{
+  auto mesh = nrs->meshV;
+  auto o_FUx = nrs->fluid->o_EXT + 0 * nrs->fluid->fieldOffset;
+  platform->linAlg->fill(mesh->Nlocal, g_dpdx, o_FUx);
+}
+
+void UDF_Setup0(MPI_Comm comm, setupAide &options)
+{
+  platform->par->extract("casedata", "wm_kappa", g_kappa);
+  platform->par->extract("casedata", "wm_b", g_B);
+  platform->par->extract("casedata", "wm_y0plus", g_y0Plus);
+  platform->par->extract("casedata", "wm_z_input", g_zInput);
+  platform->par->extract("casedata", "vwall_lo", g_vwallLo);
+  platform->par->extract("casedata", "vwall_hi", g_vwallHi);
+  platform->par->extract("casedata", "ic_amp", g_icAmp);
+  platform->par->extract("casedata", "diag_every", g_diagEvery);
+}
+
+void UDF_LoadKernels(deviceKernelProperties &kernelInfo) {}
+
+// Collect this rank's boundary nodes (volume index, unit normal, quadrature
+// weight, coordinates), check that each wall sits where expected, size
+// o_usrwrk for the traction block and print the near-wall grid.
+static void wallModelSetup()
+{
+  auto mesh = nrs->meshV;
+  const size_t sgeoExpected = static_cast<size_t>(mesh->Nelements) * mesh->Nfaces * mesh->Nfp * mesh->Nsgeo;
+  if (mesh->o_sgeo.size() != sgeoExpected) {
+    throw std::runtime_error("wallModelSetup: mesh->o_sgeo size != Nelements*Nfaces*Nfp*Nsgeo");
+  }
+  std::vector<dfloat> sgeoHost(sgeoExpected);
+  mesh->o_sgeo.copyTo(sgeoHost.data(), sgeoHost.size());
+  const auto xyzAll = mesh->xyzHost();
+  const auto &xHost = std::get<0>(xyzAll);
+  const auto &yHost = std::get<1>(xyzAll);
+  const auto &zHost = std::get<2>(xyzAll);
+
+  g_nodes.clear();
+  g_nodeWsJ.clear();
+  g_nodeX.clear();
+  g_nodeY.clear();
+  g_nodeZ.clear();
+  auto addWall = [&](int bid) -> size_t {
+    size_t cnt = 0;
+    for (dlong e = 0; e < mesh->Nelements; e++) {
+      for (int f = 0; f < mesh->Nfaces; f++) {
+        if (mesh->EToB[f + mesh->Nfaces * e] != bid) {
+          continue;
+        }
+        for (int n = 0; n < mesh->Nfp; n++) {
+          const size_t sid = static_cast<size_t>(e) * mesh->Nfaces * mesh->Nfp + static_cast<size_t>(f) * mesh->Nfp + n;
+          wm::BoundaryNode nd;
+          nd.idxVol = static_cast<size_t>(mesh->vmapM[sid]);
+          nd.nx = sgeoHost[sid * mesh->Nsgeo + NXID];
+          nd.ny = sgeoHost[sid * mesh->Nsgeo + NYID];
+          nd.nz = sgeoHost[sid * mesh->Nsgeo + NZID];
+          g_nodes.push_back(nd);
+          g_nodeWsJ.push_back(sgeoHost[sid * mesh->Nsgeo + WSJID]);
+          g_nodeX.push_back(xHost[nd.idxVol]);
+          g_nodeY.push_back(yHost[nd.idxVol]);
+          g_nodeZ.push_back(zHost[nd.idxVol]);
+          cnt++;
+        }
+      }
+    }
+    return cnt;
+  };
+  g_nWall1 = addWall(kWallId1);
+  addWall(kWallId2);
+
+  double loc[4] = {0, 0, 0, 0}; // n1, sum y1, n2, sum y2
+  for (size_t k = 0; k < g_nodes.size(); ++k) {
+    if (k < g_nWall1) {
+      loc[0] += 1;
+      loc[1] += g_nodeY[k];
+    } else {
+      loc[2] += 1;
+      loc[3] += g_nodeY[k];
+    }
+  }
+  double glob[4] = {0, 0, 0, 0};
+  MPI_Allreduce(loc, glob, 4, MPI_DOUBLE, MPI_SUM, platform->comm.mpiComm());
+  if (!(glob[0] > 0) || !(glob[2] > 0)) {
+    throw std::runtime_error("wallModelSetup: a wall has no boundary nodes (check boundary ids in channel.usr)");
+  }
+  g_wallY1 = glob[1] / glob[0];
+  g_wallY2 = glob[3] / glob[2];
+
+  const dlong fo = nrs->fluid->fieldOffset;
+  platform->app->bc->o_usrwrk.resize(3 * static_cast<size_t>(fo));
+  std::vector<dfloat> zero(3 * static_cast<size_t>(fo), dfloat(0));
+  platform->app->bc->o_usrwrk.copyFrom(zero.data(), zero.size());
+
+  dfloat nu = 0;
+  platform->options.getArgs("FLUID VISCOSITY", nu);
+  // node heights of the first elements above the lower boundary, measured
+  // from the virtual wall, in wall units at u_tau = 1 (y+ = dist/nu)
+  std::set<long long> mine;
+  for (dlong i = 0; i < mesh->Nlocal; ++i) {
+    if (yHost[i] < g_meshYLo + dfloat(0.3)) {
+      mine.insert(std::llround(static_cast<double>(yHost[i]) * 1.0e9));
+    }
+  }
+  std::vector<long long> loc2(mine.begin(), mine.end());
+  int nloc = static_cast<int>(loc2.size());
+  std::vector<int> counts(platform->comm.mpiCommSize(), 0), displs(platform->comm.mpiCommSize(), 0);
+  MPI_Gather(&nloc, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, platform->comm.mpiComm());
+  int tot = 0;
+  if (platform->comm.mpiRank() == 0) {
+    for (size_t r = 0; r < counts.size(); ++r) {
+      displs[r] = tot;
+      tot += counts[r];
+    }
+  }
+  std::vector<long long> all(static_cast<size_t>(std::max(tot, 1)));
+  MPI_Gatherv(loc2.data(), nloc, MPI_LONG_LONG, all.data(), counts.data(), displs.data(), MPI_LONG_LONG, 0,
+              platform->comm.mpiComm());
+  if (platform->comm.mpiRank() == 0) {
+    std::set<long long> uniq(all.begin(), all.begin() + tot);
+    printf("logbnd-setup: vwallLo=%.10g vwallHi=%.10g meshYLo=%.10g meshYHi=%.10g zInput=%.10g h=%.10g "
+           "wall1(id %d) n=%.0f meanY=%.8g wall2(id %d) n=%.0f meanY=%.8g nu=%.8g dpdx=%.10g\n",
+           static_cast<double>(g_vwallLo), static_cast<double>(g_vwallHi), static_cast<double>(g_meshYLo),
+           static_cast<double>(g_meshYHi), static_cast<double>(g_zInput),
+           static_cast<double>((g_yHi - g_yLo) / dfloat(2)), kWallId1, glob[0], static_cast<double>(g_wallY1),
+           kWallId2, glob[2], static_cast<double>(g_wallY2), static_cast<double>(nu), static_cast<double>(g_dpdx));
+    int k = 0;
+    for (long long v : uniq) {
+      const double y = static_cast<double>(v) * 1.0e-9;
+      printf("logbnd-grid: k=%d y=%.9f distFromVwall=%.9f yplus=%.4f\n", k++, y,
+             y - static_cast<double>(g_vwallLo), (y - static_cast<double>(g_vwallLo)) / static_cast<double>(nu));
+    }
+  }
+}
+
+// Per-step traction update and (every g_diagEvery steps) diagnostics.
+static void wallModelStep(double time, int tstep, dfloat nu)
+{
+  auto mesh = nrs->meshV;
+  const dlong N = mesh->Nlocal;
+  const dlong fo = nrs->fluid->fieldOffset;
+  const MPI_Comm comm = platform->comm.mpiComm();
+  std::vector<dfloat> ux(fo, dfloat(0)), uy(fo, dfloat(0)), uz(fo, dfloat(0));
+  nrs->fluid->o_U.copyTo(ux.data(), N, 0 * fo);
+  nrs->fluid->o_U.copyTo(uy.data(), N, 1 * fo);
+  nrs->fluid->o_U.copyTo(uz.data(), N, 2 * fo);
+
+  std::vector<dfloat> blk, uTau, uTang;
+  wm::fillTraction(g_law, g_zInput, nu, ux, uy, uz, g_nodes, static_cast<size_t>(fo), blk, &uTau, &uTang);
+  platform->app->bc->o_usrwrk.copyFrom(blk.data(), blk.size());
+  if (tstep <= 3) {
+    // device read-back check of the traction block layout (blocks of fieldOffset)
+    std::vector<dfloat> back(blk.size(), dfloat(-999));
+    platform->app->bc->o_usrwrk.copyTo(back, back.size());
+    double md = 0;
+    for (size_t i = 0; i < blk.size(); ++i) {
+      md = std::max(md, std::fabs(static_cast<double>(back[i] - blk[i])));
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &md, 1, MPI_DOUBLE, MPI_MAX, comm);
+    if (platform->comm.mpiRank() == 0) {
+      printf("logbnd-sync: step=%d fieldOffset=%d bcFieldOffsetNote=usrwrk-readback maxdiff=%.3e\n", tstep,
+             static_cast<int>(fo), md);
+    }
+    if (md != 0) {
+      throw std::runtime_error("wallModelStep: o_usrwrk read-back differs from the host traction block");
+    }
+  }
+
+  if (!(tstep <= 3 || (g_diagEvery > 0 && tstep % g_diagEvery == 0) || nrs->lastStep)) {
+    return;
+  }
+
+  // ---- diagnostics (read-only)
+  // per-wall integrals of the delivered traction vector (sum of WsJ * tr) and area
+  double fsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (size_t k = 0; k < g_nodes.size(); ++k) {
+    const size_t o = (k < g_nWall1) ? 0 : 4;
+    const size_t id = g_nodes[k].idxVol;
+    fsum[o + 0] += g_nodeWsJ[k] * blk[0 * fo + id];
+    fsum[o + 1] += g_nodeWsJ[k] * blk[1 * fo + id];
+    fsum[o + 2] += g_nodeWsJ[k] * blk[2 * fo + id];
+    fsum[o + 3] += g_nodeWsJ[k];
+  }
+  MPI_Allreduce(MPI_IN_PLACE, fsum, 8, MPI_DOUBLE, MPI_SUM, comm);
+
+  // bulk velocity over the simulated region and max speed
+  const dfloat vol = platform->linAlg->sum(N, mesh->o_LMM, comm);
+  auto o_ux = nrs->fluid->o_U.slice(0, N);
+  const dfloat ub = platform->linAlg->innerProd(N, mesh->o_LMM, o_ux, comm) / vol;
+  double maxU = 0;
+  for (dlong i = 0; i < N; ++i) {
+    maxU = std::max(maxU, static_cast<double>(std::sqrt(ux[i] * ux[i] + uy[i] * uy[i] + uz[i] * uz[i])));
+  }
+  MPI_Allreduce(MPI_IN_PLACE, &maxU, 1, MPI_DOUBLE, MPI_MAX, comm);
+
+  // gather per-node records (wall, x, z, uTau, |u_t|, ux) to rank 0 and drop
+  // nodes shared between elements, keyed by (wall, x, z). Note: the periodic
+  // image lines (x = 0 and Lx, z = 0 and Lz) have different coordinates and
+  // are therefore kept twice; the *_mean values below are unweighted node
+  // means, while Fx/Fy/Fz/A are quadrature-weighted integrals.
+  std::vector<double> rec;
+  rec.reserve(6 * g_nodes.size());
+  for (size_t k = 0; k < g_nodes.size(); ++k) {
+    rec.push_back(k < g_nWall1 ? 1.0 : 2.0);
+    rec.push_back(g_nodeX[k]);
+    rec.push_back(g_nodeZ[k]);
+    rec.push_back(uTau[k]);
+    rec.push_back(uTang[k]);
+    rec.push_back(ux[g_nodes[k].idxVol]);
+  }
+  int nloc = static_cast<int>(rec.size());
+  std::vector<int> counts(platform->comm.mpiCommSize(), 0), displs(platform->comm.mpiCommSize(), 0);
+  MPI_Gather(&nloc, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, comm);
+  int tot = 0;
+  if (platform->comm.mpiRank() == 0) {
+    for (size_t r = 0; r < counts.size(); ++r) {
+      displs[r] = tot;
+      tot += counts[r];
+    }
+  }
+  std::vector<double> all(static_cast<size_t>(std::max(tot, 1)));
+  MPI_Gatherv(rec.data(), nloc, MPI_DOUBLE, all.data(), counts.data(), displs.data(), MPI_DOUBLE, 0, comm);
+  if (platform->comm.mpiRank() != 0) {
+    return;
+  }
+  std::vector<dfloat> tau[2], tang[2], uxn[2];
+  std::set<std::tuple<int, long long, long long>> seen;
+  for (int i = 0; i + 5 < tot; i += 6) {
+    const int w = static_cast<int>(all[i]) - 1;
+    const auto key = std::make_tuple(w, std::llround(all[i + 1] * 1.0e6), std::llround(all[i + 2] * 1.0e6));
+    if (!seen.insert(key).second) {
+      continue;
+    }
+    tau[w].push_back(all[i + 3]);
+    tang[w].push_back(all[i + 4]);
+    uxn[w].push_back(all[i + 5]);
+  }
+  printf("[logbnd] step=%d t=%.8e Ubulk_res=%.8f maxU=%.6f\n", tstep, time, static_cast<double>(ub), maxU);
+  for (int w = 0; w < 2; ++w) {
+    const auto st = wm::sampleStats(tau[w]);
+    const auto sg = wm::sampleStats(tang[w]);
+    const auto sx = wm::sampleStats(uxn[w]);
+    printf("[logbnd-wall] step=%d t=%.8e wall=%d id=%d meanY=%.6f nUnique=%zu uTau_mean=%.8f uTau_std=%.8f "
+           "uTau_min=%.8f uTau_max=%.8f uTau_p5=%.8f uTau_p95=%.8f Utang_mean=%.8f Ux_mean=%.8f "
+           "Fx=%.10f Fy=%.10f Fz=%.10f A=%.8f\n",
+           tstep, time, w + 1, w == 0 ? kWallId1 : kWallId2, static_cast<double>(w == 0 ? g_wallY1 : g_wallY2),
+           st.n, static_cast<double>(st.mean), static_cast<double>(st.stddev), static_cast<double>(st.min),
+           static_cast<double>(st.max), static_cast<double>(st.p5), static_cast<double>(st.p95),
+           static_cast<double>(sg.mean), static_cast<double>(sx.mean), fsum[4 * w + 0], fsum[4 * w + 1],
+           fsum[4 * w + 2], fsum[4 * w + 3]);
+  }
+}
+
+void UDF_Setup()
+{
+  auto mesh = nrs->meshV;
+  const MPI_Comm comm = platform->comm.mpiComm();
+
+  wm::LogLawParams params;
+  params.kappa = g_kappa;
+  params.B = g_B;
+  g_law.setup(params);
+
+  // ---- geometry: the mesh spans [vwall_lo + zInput, vwall_hi - zInput] in y
+  g_meshYLo = platform->linAlg->min(mesh->Nlocal, mesh->o_y, comm);
+  g_meshYHi = platform->linAlg->max(mesh->Nlocal, mesh->o_y, comm);
+  const dfloat tolD = dfloat(1e-4) * g_zInput;
+  if (!(g_zInput > dfloat(0)) || !(g_vwallLo < g_meshYLo) || !(g_vwallHi > g_meshYHi) ||
+      std::fabs((g_meshYLo - g_vwallLo) - g_zInput) > tolD || std::fabs((g_vwallHi - g_meshYHi) - g_zInput) > tolD) {
+    throw std::runtime_error("UDF_Setup: the mesh boundaries must lie wm_z_input inside the virtual walls "
+                             "(vwall_lo=" + std::to_string(static_cast<double>(g_vwallLo)) +
+                             " meshYLo=" + std::to_string(static_cast<double>(g_meshYLo)) +
+                             " meshYHi=" + std::to_string(static_cast<double>(g_meshYHi)) +
+                             " vwall_hi=" + std::to_string(static_cast<double>(g_vwallHi)) +
+                             " wm_z_input=" + std::to_string(static_cast<double>(g_zInput)) + ")");
+  }
+  // The channel (h, IC wall distances, forcing) is defined by the virtual walls.
+  g_yLo = g_vwallLo;
+  g_yHi = g_vwallHi;
+
+  g_xLo = platform->linAlg->min(mesh->Nlocal, mesh->o_x, comm);
+  g_xHi = platform->linAlg->max(mesh->Nlocal, mesh->o_x, comm);
+  g_zLo = platform->linAlg->min(mesh->Nlocal, mesh->o_z, comm);
+  g_zHi = platform->linAlg->max(mesh->Nlocal, mesh->o_z, comm);
+
+  // ---- forcing: -dp/dx = rho*u_tau^2/h with u_tau = 1
+  dfloat rho = 0;
+  platform->options.getArgs("FLUID DENSITY", rho);
+  const dfloat uTau = dfloat(1);
+  const dfloat h = (g_yHi - g_yLo) / dfloat(2);
+  g_dpdx = rho * uTau * uTau / h;
+  if (!platform->options.compareArgs("CONSTANT FLOW RATE", "FALSE")) {
+    throw std::runtime_error("UDF_Setup: this case is driven by a constant pressure gradient; "
+                             "remove constFlowRate from the .par");
+  }
+  nrs->userSource = &userf;
+
+  // ---- initial condition (fresh start only)
+  if (platform->options.getArgs("RESTART FILE NAME").empty()) {
+    dfloat nu = 0;
+    platform->options.getArgs("FLUID VISCOSITY", nu);
+    if (!(nu > dfloat(0))) {
+      throw std::runtime_error("UDF_Setup: positive FLUID VISCOSITY required for the initial condition");
+    }
+    if (!(g_icAmp >= dfloat(0))) {
+      throw std::runtime_error("UDF_Setup: [CASEDATA] ic_amp must be set (>= 0)");
+    }
+    const dfloat Lx = g_xHi - g_xLo;
+    const dfloat Lz = g_zHi - g_zLo;
+
+    // Mean: U+ = y+ below wm_y0plus, log law above, y measured from the
+    // nearest virtual wall, u_tau = 1.
+    auto meanUPlusAt = [&](dfloat yWall) -> dfloat {
+      if (!(yWall > dfloat(0))) {
+        return dfloat(0);
+      }
+      const dfloat yPlus = yWall * uTau / nu;
+      return (yPlus < g_y0Plus) ? yPlus : g_law.uPlusOf(yPlus);
+    };
+    const dfloat uCenterline = meanUPlusAt(h) * uTau;
+    const dfloat amp = g_icAmp * uCenterline;
+    const dfloat alpha = dfloat(2) * dfloat(M_PI) / Lx;
+    const dfloat beta = dfloat(2) * dfloat(M_PI) / Lz;
+
+    if (platform->comm.mpiRank() == 0) {
+      printf("channel IC: uCenterline=%g amp=%g alpha=%g beta=%g\n", static_cast<double>(uCenterline),
+             static_cast<double>(amp), static_cast<double>(alpha), static_cast<double>(beta));
+    }
+
+    // Perturbation = curl(A), A = (g(y) sin(beta z), 0, g(y) sin(alpha x)),
+    // g(y) = [(y-yLo)(yHi-y)]^2: exactly divergence-free, and g, g' vanish
+    // at the virtual walls.
+    auto [xHost, yHost, zHost] = mesh->xyzHost();
+    std::vector<dfloat> U(mesh->dim * nrs->fluid->fieldOffset, 0.0);
+    for (int n = 0; n < mesh->Nlocal; n++) {
+      const dfloat xn = xHost[n], yn = yHost[n], zn = zHost[n];
+      const dfloat yWall = std::min(yn - g_yLo, g_yHi - yn);
+      const dfloat uMean = meanUPlusAt(yWall) * uTau;
+      const dfloat t = (yn - g_yLo) * (g_yHi - yn);
+      const dfloat gFun = t * t;
+      const dfloat gPrime = dfloat(2) * t * (g_yHi + g_yLo - dfloat(2) * yn);
+      const dfloat up = amp * gPrime * std::sin(alpha * xn);
+      const dfloat vp = amp * gFun * (beta * std::cos(beta * zn) - alpha * std::cos(alpha * xn));
+      const dfloat wp = -amp * gPrime * std::sin(beta * zn);
+      U[n + 0 * nrs->fluid->fieldOffset] = uMean + up;
+      U[n + 1 * nrs->fluid->fieldOffset] = vp;
+      U[n + 2 * nrs->fluid->fieldOffset] = wp;
+    }
+    nrs->fluid->o_U.copyFrom(U.data(), U.size());
+  }
+
+  wallModelSetup();
+}
+
+void UDF_ExecuteStep(double time, int tstep)
+{
+  dfloat nu = 0;
+  platform->options.getArgs("FLUID VISCOSITY", nu);
+  wallModelStep(time, tstep, nu);
+}

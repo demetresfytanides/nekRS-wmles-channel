@@ -1,0 +1,14 @@
+# build and run products
+*.re2
+*.ma2
+*.f0*
+*0.f*
+.cache/
+cache/
+*.o[0-9]*
+.lhelper
+.romio_hint
+test_wall_model
+timeseries.csv
+run/
+__pycache__/

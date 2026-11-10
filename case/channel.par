@@ -1,0 +1,46 @@
+# Wall-modelled LES of a periodic plane channel, Re_tau = 5200 (README.md).
+# Units: half-height h = 1 (measured to the virtual walls), u_tau = 1 set by
+# the forcing, rho = 1, so nu = 1/Re_tau.
+#
+# nekRS v26 schema ([FLUID VELOCITY]/[FLUID PRESSURE]); [CASEDATA] is a user
+# section and must be declared via userSections.
+userSections = CASEDATA
+
+[GENERAL]
+polynomialOrder = 7
+numSteps = 15000
+dt = 0.0001
+timeStepper = tombo2
+writeInterval = 1000
+regularization = hpfrt + nModes=1 + scalingCoeff=10
+advectionSubCyclingSteps = 8
+
+[OCCA]
+# overridden on the command line on GPUs (--backend dpcpp / cuda / hip)
+backend = SERIAL
+
+[FLUID PRESSURE]
+residualTol = 1e-06
+
+[FLUID VELOCITY]
+# one entry per boundary id (channel.usr): 1 = top wall, 2 = bottom wall
+boundaryTypeMap = zeroDirichletN/udfNeumann, zeroDirichletN/udfNeumann
+residualTol = 1e-08
+rho = 1.0
+viscosity = -5200.0
+
+[CASEDATA]
+# log law U+ = ln(y+)/kappa + B
+wm_kappa = 0.41
+wm_b = 5.2
+# distance from each virtual wall to its mesh boundary (y+ = 100 at u_tau = 1)
+wm_z_input = 0.0192307692307692
+# virtual-wall positions (the mesh spans [vwall_lo + wm_z_input, vwall_hi - wm_z_input])
+vwall_lo = 0.0
+vwall_hi = 2.0
+# initial condition: U+ = y+ below this y+, log law above
+wm_y0plus = 11.53
+# initial perturbation amplitude as a fraction of the centreline velocity
+ic_amp = 0.024228
+# diagnostics print interval (steps)
+diag_every = 100
