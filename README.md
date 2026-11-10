@@ -91,7 +91,7 @@ So the wall normal is taken from the mesh. The code never assumes it is ±y.
 
 **Step 2, tangential velocity at the boundary node itself.** At each boundary node:
 
-$$\mathbf{u}_t = \mathbf{u} - (\mathbf{u}\cdot\mathbf{n})\,\mathbf{n}, \qquad U_t = \lvert \mathbf{u}_t \rvert .$$
+$$\mathbf{u}_t = \mathbf{u} - (\mathbf{u}\cdot\mathbf{n}) \mathbf{n}, \qquad U_t = \lvert \mathbf{u}_t \rvert .$$
 
 - The input is the node's own instantaneous velocity.
 - There is no plane average, no sampling at a different height and no time filtering.
@@ -99,14 +99,14 @@ $$\mathbf{u}_t = \mathbf{u} - (\mathbf{u}\cdot\mathbf{n})\,\mathbf{n}, \qquad U_
 
 **Step 3, invert the log law.** The node sits at height z₁ = 100/5200 above its virtual wall (`wm_z_input` in the `.par`). Solve the smooth-wall log law
 
-$$U_t = u_\tau \, U^+\!\left(\frac{z_1 u_\tau}{\nu}\right), \qquad U^+(y^+) = \frac{1}{\kappa}\ln y^+ + B, \qquad \kappa = 0.41,\; B = 5.2,$$
+$$U_t = u_\tau   U^+\left(\frac{z_1 u_\tau}{\nu}\right), \qquad U^+(y^+) = \frac{1}{\kappa}\ln y^+ + B, \qquad \kappa = 0.41,\quad  B = 5.2,$$
 
 for u_τ by Newton iteration (`wm::LogLaw::invertUTau`):
 
 | Newton step | Formula |
 |---|---|
-| initial guess | $u_\tau^{0} = \sqrt{U_t\,\nu / z_1}$ (the viscous-sublayer estimate) |
-| residual | $F(u_\tau) = u_\tau\, U^+(z_1 u_\tau/\nu) - U_t$ |
+| initial guess | $u_\tau^{0} = \sqrt{U_t \nu / z_1}$ (the viscous-sublayer estimate) |
+| residual | $F(u_\tau) = u_\tau  U^+(z_1 u_\tau/\nu) - U_t$ |
 | derivative | $F'(u_\tau) = U^+(z_1 u_\tau/\nu) + 1/\kappa$ |
 | update | $u_\tau \leftarrow u_\tau - F/F'$; if that would give $u_\tau \le 0$, use $u_\tau \leftarrow u_\tau/2$ instead |
 | stop | relative change $\le 10^{-10}$, or 50 iterations |
@@ -117,7 +117,7 @@ for u_τ by Newton iteration (`wm::LogLaw::invertUTau`):
 
 **Step 4, traction.** The wall shear stress is applied opposite the local tangential velocity:
 
-$$\boldsymbol{\tau} = -\,u_\tau^{2}\,\frac{\mathbf{u}_t}{U_t} \qquad (\text{kinematic},\ \rho = 1;\ \lvert\boldsymbol{\tau}\rvert = u_\tau^{2}).$$
+$$\boldsymbol{\tau} = - u_\tau^{2} \frac{\mathbf{u}_t}{U_t} \qquad (\text{kinematic},\ \rho = 1;\ \lvert\boldsymbol{\tau}\rvert = u_\tau^{2}).$$
 
 - The three global components of τ are written into `o_usrwrk` as three blocks of length `fieldOffset`, at each node's volume index.
 - On the device, `udfNeumann` in `case/channel.oudf` projects τ onto the kernel's local tangent vectors t₁ and t₂ (`tr1 = τ·t₁`, `tr2 = τ·t₂`).
@@ -138,7 +138,7 @@ Every `diag_every` steps (default 100), each wall prints a `[logbnd-wall]` line.
 
 **What value to expect.** The simulated region ends at y = z₁, not at the virtual wall. In a statistically steady state the traction at the mesh boundary balances the pressure gradient over the simulated height only:
 
-$$2\,\tau_b = G\,(2 - 2z_1) \;\Rightarrow\; \tau_b = 1 - z_1 = 0.981, \qquad u_{\tau,F} = \sqrt{1 - z_1} = 0.990,$$
+$$2 \tau_b = G (2 - 2z_1) \quad \Rightarrow\quad  \tau_b = 1 - z_1 = 0.981, \qquad u_{\tau,F} = \sqrt{1 - z_1} = 0.990,$$
 
 with G = −dp/dx = 1 the imposed pressure gradient.
 
