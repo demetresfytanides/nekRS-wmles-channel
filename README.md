@@ -8,20 +8,20 @@ This is a wall-modelled large-eddy simulation (WMLES) of turbulent plane channel
   - The mesh stops at y⁺ = 100 above two *virtual walls*.
   - At each boundary node, a log-law wall model supplies the wall shear stress as a traction boundary condition.
 
-This case was taken out of a larger sediment-transport project. Everything related to sediment, beds, the moving mesh and the case generator has been removed. What is left is the flow solver setup that ran there as job 9045014 (see [Status](#status-what-has-been-run-and-what-it-showed)).
+This case was taken out of a larger sediment-transport project. Everything related to sediment, beds, the moving mesh and the case generator has been removed. What is left is the flow solver setup that ran there as job 9045014 (see [Status](#6-status-what-has-been-run-and-what-it-showed)).
 
 ---
 
 ## 1. What is simulated
 
-| | |
+| Quantity | Value |
 |---|---|
 | Flow | incompressible, constant density and viscosity |
 | Domain | Lx × Ly × Lz = 4 × (2 − 2z₁) × 2, in units of the half-height h |
 | Virtual walls | y = 0 and y = 2 (not part of the mesh) |
 | Mesh boundaries | y = z₁ and y = 2 − z₁, z₁ = 100/5200 = 0.019231 (y⁺ = 100) |
 | Periodicity | x and z |
-| Forcing | constant −dp/dx = ρu_τ²/h = 1 |
+| Forcing | constant G = −dp/dx = ρu_τ²/h = 1 |
 | Re_τ | h u_τ / ν = 5200 (ν = 1/5200) |
 | Elements | 16 × 20 × 8 = 2560 hexahedra, polynomial order 7 (8 GLL points per direction) |
 | Mean spacing | Δx⁺ ≈ 186, Δz⁺ ≈ 186 (element size / 7) |
@@ -91,7 +91,7 @@ So the wall normal is taken from the mesh. The code never assumes it is ±y.
 
 **Step 2, tangential velocity at the boundary node itself.** At each boundary node:
 
-  **u_t = u − (u·n) n**,  |u_t| = its magnitude.
+$$\mathbf{u}_t = \mathbf{u} - (\mathbf{u}\cdot\mathbf{n})\,\mathbf{n}, \qquad U_t = \lvert \mathbf{u}_t \rvert .$$
 
 - The input is the node's own instantaneous velocity.
 - There is no plane average, no sampling at a different height and no time filtering.
@@ -99,25 +99,25 @@ So the wall normal is taken from the mesh. The code never assumes it is ±y.
 
 **Step 3, invert the log law.** The node sits at height z₁ = 100/5200 above its virtual wall (`wm_z_input` in the `.par`). Solve the smooth-wall log law
 
-  |u_t| = u_τ · [ (1/κ) ln(z₁ u_τ / ν) + B ],  κ = 0.41, B = 5.2,
+$$U_t = u_\tau \, U^+\!\left(\frac{z_1 u_\tau}{\nu}\right), \qquad U^+(y^+) = \frac{1}{\kappa}\ln y^+ + B, \qquad \kappa = 0.41,\; B = 5.2,$$
 
 for u_τ by Newton iteration (`wm::LogLaw::invertUTau`):
 
-| | |
+| Newton step | Formula |
 |---|---|
-| initial guess | u_τ⁰ = √(|u_t| ν / z₁), the viscous-sublayer estimate |
-| residual | F(u_τ) = u_τ U⁺(z₁u_τ/ν) − |u_t| |
-| derivative | F′(u_τ) = U⁺ + 1/κ |
-| update | u_τ ← u_τ − F/F′, halved instead if the update would go non-positive |
-| stop | relative change ≤ 1e-10, or 50 iterations |
+| initial guess | $u_\tau^{0} = \sqrt{U_t\,\nu / z_1}$ (the viscous-sublayer estimate) |
+| residual | $F(u_\tau) = u_\tau\, U^+(z_1 u_\tau/\nu) - U_t$ |
+| derivative | $F'(u_\tau) = U^+(z_1 u_\tau/\nu) + 1/\kappa$ |
+| update | $u_\tau \leftarrow u_\tau - F/F'$; if that would give $u_\tau \le 0$, use $u_\tau \leftarrow u_\tau/2$ instead |
+| stop | relative change $\le 10^{-10}$, or 50 iterations |
 
-- If |u_t| = 0, then u_τ = 0.
+- If U_t = 0, then u_τ = 0.
 - Only the log branch is used. With z₁⁺ = 100 nominal, the boundary node is always in the log layer unless u_τ falls below about 0.12. Job 9045014 did have individual nodes down to u_τ ≈ 0.005; the log law is still applied there.
 - The unit test (`tests/test_wall_model.cpp`) checks that the inversion recovers u_τ to 1e-12 for u_τ from 0.05 to 2.5.
 
 **Step 4, traction.** The wall shear stress is applied opposite the local tangential velocity:
 
-  **τ = −u_τ² u_t / |u_t|**  (kinematic, ρ = 1; |τ| = u_τ²).
+$$\boldsymbol{\tau} = -\,u_\tau^{2}\,\frac{\mathbf{u}_t}{U_t} \qquad (\text{kinematic},\ \rho = 1;\ \lvert\boldsymbol{\tau}\rvert = u_\tau^{2}).$$
 
 - The three global components of τ are written into `o_usrwrk` as three blocks of length `fieldOffset`, at each node's volume index.
 - On the device, `udfNeumann` in `case/channel.oudf` projects τ onto the kernel's local tangent vectors t₁ and t₂ (`tr1 = τ·t₁`, `tr2 = τ·t₂`).
@@ -138,7 +138,9 @@ Every `diag_every` steps (default 100), each wall prints a `[logbnd-wall]` line.
 
 **What value to expect.** The simulated region ends at y = z₁, not at the virtual wall. In a statistically steady state the traction at the mesh boundary balances the pressure gradient over the simulated height only:
 
-  2 τ_b = G (2 − 2z₁)  →  τ_b = 1 − z₁ = 0.981,  u_τ,F = √(1 − z₁) = 0.990.
+$$2\,\tau_b = G\,(2 - 2z_1) \;\Rightarrow\; \tau_b = 1 - z_1 = 0.981, \qquad u_{\tau,F} = \sqrt{1 - z_1} = 0.990,$$
+
+with G = −dp/dx = 1 the imposed pressure gradient.
 
 The full-height value u_τ = 1 belongs to the virtual wall.
 
